@@ -11,9 +11,14 @@ from predictor import predict_next_10_days
 import threading
 import time
 from sklearn.metrics import mean_squared_error, mean_absolute_error
+import logging
 
 app = Flask(__name__)
 CORS(app)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Set to Indian timezone
 IST = pytz.timezone('Asia/Kolkata')
@@ -24,6 +29,7 @@ trained_models = {}
 model_lock = threading.Lock()
 training_status = {}  # Tracks training progress per ticker
 
+# API Key - Consider moving to environment variables
 EODHD_API_KEY = "67c3793e67ebc4.02813409"
 
 @app.route('/api/status/<ticker>', methods=['GET'])
@@ -33,9 +39,15 @@ def get_status(ticker):
         if ticker in trained_models:
             return jsonify({'status': 'ready'})
         if ticker in training_status:
+            status = training_status[ticker]
+            if status.get('status') == 'failed':
+                return jsonify({
+                    'status': 'failed',
+                    'error': status.get('error', 'Unknown error')
+                }), 500
             return jsonify({
                 'status': 'training',
-                'progress': training_status[ticker].get('progress', 0)
+                'progress': status.get('progress', 0)
             })
     return jsonify({'status': 'not_started'}), 404
 
@@ -60,10 +72,16 @@ def predict(ticker):
             })
         
         if ticker in training_status:
+            status = training_status[ticker]
+            if status.get('status') == 'failed':
+                return jsonify({
+                    'status': 'failed',
+                    'error': status.get('error', 'Unknown error')
+                }), 500
             return jsonify({
                 'status': 'training',
-                'message': f'Training {ticker} (Epoch {training_status[ticker].get("epoch", 0)}/10)',
-                'progress': training_status[ticker].get('progress', 0)
+                'message': f'Training {ticker} (Epoch {status.get("epoch", 0)}/10)',
+                'progress': status.get('progress', 0)
             }), 202
         
         return jsonify({
@@ -90,10 +108,10 @@ def train():
         training_status[ticker] = {'status': 'training', 'progress': 0, 'epoch': 0}
     
     threading.Thread(
-        target=train_model_async,
-        args=(ticker, start_date, EODHD_API_KEY),
-        daemon=True
-    ).start()
+    target=train_model_async,
+    args=(ticker, start_date, None),  # Pass None instead of API key
+    daemon=True
+).start()
     
     return jsonify({
         'status': 'training_started',
@@ -101,14 +119,14 @@ def train():
         'message': f'Training started for {ticker}. Poll /api/predict/{ticker} for updates.'
     }), 202
 
-def train_model_async(ticker, start_date, api_key):
+def train_model_async(ticker, start_date, api_key=None):
     try:
         # Get current date in IST
         current_date = datetime.now(IST)
-        end_date = current_date.strftime('%Y-%m-%d')
+        end_date = (current_date + timedelta(days=1)).strftime('%Y-%m-%d')  # Include today
         
-        # 1. Fetch stock data
-        stock_prices, dates = fetch_stock_data(ticker, start_date, end_date, api_key)
+        # 1. Fetch stock data (using Yahoo Finance now)
+        stock_prices, dates = fetch_stock_data(ticker, start_date, end_date)
         if stock_prices is None:
             raise ValueError(f"Failed to fetch stock data for {ticker}")
         
@@ -116,6 +134,7 @@ def train_model_async(ticker, start_date, api_key):
         dates = [datetime.strptime(d, '%Y-%m-%d').replace(tzinfo=IST) if isinstance(d, str) else d for d in dates]
         
         # 2. Fetch and analyze news sentiment
+        logger.info(f"Fetching news articles for {ticker}")
         articles = fetch_news_articles(api_key, ticker)
         sentiments = analyze_sentiment(articles) if articles else np.zeros(len(stock_prices))
         
@@ -125,9 +144,17 @@ def train_model_async(ticker, start_date, api_key):
         sentiments = sentiments[:min_length]
         dates = dates[:min_length]
         
+        # Ensure we have enough data for training
+        if len(stock_prices) < 60:
+            error_msg = f"Insufficient data for {ticker}. Need at least 60 data points, got {len(stock_prices)}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        logger.info("Preprocessing data...")
         X, y, scaler = preprocess_data(stock_prices, sentiments)
         
         # 4. Train model
+        logger.info("Building and training model...")
         model = build_lstm_model((X.shape[1], X.shape[2]))
         for epoch in range(10):
             model.fit(X, y, batch_size=32, epochs=1, verbose=0)
@@ -139,6 +166,7 @@ def train_model_async(ticker, start_date, api_key):
                 }
         
         # 5. Make predictions
+        logger.info("Making predictions...")
         predicted_prices = scaler.inverse_transform(model.predict(X)).flatten()
         actual_prices = stock_prices[60:].flatten()
         historical_dates = dates[60:]
@@ -171,17 +199,18 @@ def train_model_async(ticker, start_date, api_key):
             }
             training_status.pop(ticker, None)
         
-        print(f"\n=== Successfully trained model for {ticker} ===")
-        print(f"Prediction date: {current_date.strftime('%Y-%m-%d')}")
-        print(f"Forecast dates: {future_dates}")
-        print(f"RMSE: {rmse:.2f}, MAE: {mae:.2f}")
+        logger.info(f"\n=== Successfully trained model for {ticker} ===")
+        logger.info(f"Prediction date: {current_date.strftime('%Y-%m-%d')}")
+        logger.info(f"Forecast dates: {future_dates}")
+        logger.info(f"RMSE: {rmse:.2f}, MAE: {mae:.2f}")
         
     except Exception as e:
-        print(f"\n!!! Training failed for {ticker}: {str(e)}")
+        error_msg = f"Training failed for {ticker}: {str(e)}"
+        logger.error(error_msg)
         with model_lock:
             training_status[ticker] = {'status': 'failed', 'error': str(e)}
     finally:
-        print("Training process completed")
+        logger.info("Training process completed")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

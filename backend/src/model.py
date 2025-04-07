@@ -1,31 +1,37 @@
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
-import os
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.regularizers import l2
+import logging
+
+logger = logging.getLogger(__name__)
 
 def build_lstm_model(input_shape):
     """
-    Build the LSTM model.
+    Build the LSTM model with improved architecture.
     """
-    model = Sequential()
-    model.add(LSTM(units=50, return_sequences=True, input_shape=input_shape))
-    model.add(LSTM(units=50, return_sequences=False))
-    model.add(Dense(units=25))
-    model.add(Dense(units=1))
-    model.compile(optimizer='adam', loss='mean_squared_error')
-    return model
-
-def train_model(X, y, epochs=10, batch_size=32, validation_split=0.1):
-    """
-    Train the LSTM model.
-    """
-    model = build_lstm_model((X.shape[1], X.shape[2]))
-    model.fit(X, y, epochs=epochs, batch_size=batch_size, validation_split=validation_split)
-    return model
-
-def save_model(model, filepath):
-    """
-    Save the trained model to a file.
-    """
-    # Create directory if it doesn't exist
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    model.save(filepath)
+    try:
+        logger.info(f"Building LSTM model with input shape {input_shape}")
+        model = Sequential()
+        
+        # First LSTM layer with return sequences
+        model.add(LSTM(units=64, return_sequences=True, input_shape=input_shape,
+                      kernel_regularizer=l2(0.01), recurrent_regularizer=l2(0.01)))
+        model.add(Dropout(0.2))
+        
+        # Second LSTM layer
+        model.add(LSTM(units=64, return_sequences=False,
+                      kernel_regularizer=l2(0.01), recurrent_regularizer=l2(0.01)))
+        model.add(Dropout(0.2))
+        
+        # Dense layers
+        model.add(Dense(units=32, activation='relu'))
+        model.add(Dense(units=16, activation='relu'))
+        model.add(Dense(units=1))
+        
+        model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
+        
+        logger.info("Model built successfully")
+        return model
+    except Exception as e:
+        logger.error(f"Error building model: {e}")
+        raise
